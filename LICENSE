@@ -21,3 +21,163 @@ SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE
 FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
 ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+# lightweight_trading_bot.py
+"""
+Lightweight ML Day Trading Bot Template
+- Optimized for MacBook M4 + 8GB RAM
+- Uses LightGBM for price direction prediction
+- Backtesting + paper trading via Alpaca API
+"""
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import lightgbm as lgb
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import accuracy_score
+import matplotlib.pyplot as plt
+import datetime
+import alpaca_trade_api as tradeapi
+
+# ------------------------------
+# 1) Parameters
+# ------------------------------
+TICKER = "AAPL"
+START = "2025-01-01"
+END = datetime.date.today().isoformat()
+INITIAL_CAPITAL = 100000
+RISK_PER_TRADE = 0.01
+COMMISSION = 0.001  # 0.1%
+SLIPPAGE = 0.001    # 0.1%
+PROB_THRESHOLD = 0.6  # only trade if prob > 0.6
+
+# Alpaca paper trading keys (replace with your keys)
+ALPACA_API_KEY = "YOUR_ALPACA_KEY"
+ALPACA_SECRET_KEY = "YOUR_ALPACA_SECRET"
+ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
+
+# ------------------------------
+# 2) Data Download (minute-level)
+# ------------------------------
+# For prototyping, yfinance only gives daily data.
+# For real minute-level, use broker API. Here we simulate using daily.
+df = yf.download(TICKER, start=START, end=END, interval='1d', progress=False)
+df.dropna(inplace=True)
+
+# ------------------------------
+# 3) Feature Engineering
+# ------------------------------
+df['ret1'] = df['Adj Close'].pct_change()
+df['ma5'] = df['Adj Close'].rolling(5).mean()
+df['ma20'] = df['Adj Close'].rolling(20).mean()
+df['ma_ratio'] = df['ma5'] / df['ma20']
+df['vol'] = df['Volume'].rolling(10).mean()
+
+# RSI
+delta = df['Adj Close'].diff()
+up = delta.clip(lower=0)
+down = -1*delta.clip(upper=0)
+roll_up = up.ewm(span=14).mean()
+roll_down = down.ewm(span=14).mean()
+rs = roll_up / (roll_down + 1e-9)
+df['rsi'] = 100 - (100 / (1 + rs))
+
+# Target: next-day up/down
+df['target'] = (df['Adj Close'].shift(-1) > df['Adj Close']).astype(int)
+df.dropna(inplace=True)
+
+FEATURES = ['ma_ratio', 'vol', 'rsi', 'ret1']
+X = df[FEATURES]
+y = df['target']
+
+# ------------------------------
+# 4) Time-Series Cross Validation
+# ------------------------------
+tscv = TimeSeriesSplit(n_splits=5)
+train_idx, test_idx = list(tscv.split(X))[-1]
+X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+# ------------------------------
+# 5) Train LightGBM Model
+# ------------------------------
+model = lgb.LGBMClassifier(n_estimators=200, max_depth=5, random_state=42)
+model.fit(X_train, y_train)
+yhat = model.predict(X_test)
+print("Test accuracy:", accuracy_score(y_test, yhat))
+
+df['prob_up'] = model.predict_proba(X)[:,1]
+df['signal'] = (df['prob_up'] > PROB_THRESHOLD).astype(int)
+
+# ------------------------------
+# 6) Simple Backtest
+# ------------------------------
+capital = INITIAL_CAPITAL
+position = 0
+trade_log = []
+
+for i in range(len(df)-1):
+    row = df.iloc[i]
+    next_row = df.iloc[i+1]
+    
+    if row['signal'] == 1 and position == 0:
+        # buy at next open
+        buy_price = next_row['Open']*(1+SLIPPAGE)
+        dollars = capital * RISK_PER_TRADE
+        qty = dollars / buy_price
+        cost = qty*buy_price*(1+COMMISSION)
+        if cost < capital and qty > 0:
+            position = qty
+            capital -= cost
+            trade_log.append({'date': next_row.name, 'action':'BUY','price':buy_price,'qty':qty})
+    
+    # sell at close if in position
+    if position > 0:
+        sell_price = next_row['Close']*(1-SLIPPAGE)
+        proceeds = position*sell_price*(1-COMMISSION)
+        capital += proceeds
+        trade_log.append({'date': next_row.name,'action':'SELL','price':sell_price,'qty':position})
+        position = 0
+
+print("Final capital (backtest):", capital)
+
+# Equity curve
+equity_curve = pd.DataFrame(columns=['date','equity'])
+equity = INITIAL_CAPITAL
+position = 0
+for trade in trade_log:
+    if trade['action'] == 'BUY':
+        position = trade['qty']*trade['price']
+        equity -= position
+    else:
+        equity += trade['qty']*trade['price']
+        position = 0
+    equity_curve = equity_curve.append({'date':trade['date'],'equity':equity},ignore_index=True)
+
+plt.plot(equity_curve['date'], equity_curve['equity'])
+plt.title("Equity Curve (Backtest)")
+plt.xlabel("Date")
+plt.ylabel("Capital")
+plt.show()
+
+# ------------------------------
+# 7) Alpaca Paper Trading Adapter
+# ------------------------------
+api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version='v2')
+
+# Example: place order if last signal == 1
+last_signal = df['signal'].iloc[-1]
+if last_signal == 1:
+    qty = int((capital * RISK_PER_TRADE) / df['Adj Close'].iloc[-1])
+    if qty > 0:
+        api.submit_order(
+            symbol=TICKER,
+            qty=qty,
+            side='buy',
+            type='market',
+            time_in_force='day'
+        )
+        print(f"Placed paper BUY order for {qty} shares of {TICKER}")
+else:
+    print("No trade signal at last bar")
+
